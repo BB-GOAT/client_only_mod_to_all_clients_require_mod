@@ -17,228 +17,287 @@ if not TheNet:IsDedicated() and not TheNet:GetIsClient() then
     return
 end
 
--- 检测环境
--- print("专服 = ",TheNet:IsDedicated()) -- 专服始终为true，反之始终false
--- print("服务器 = ",TheNet:GetIsServer()) -- 专服初始化时为false，然后为true。使用客户端开服始终为true （客户端开服指开了独行长路的世界/无洞穴世界）
--- print("客户端 = ",TheNet:GetIsClient()) -- 客户端始终为true，反之始终false
--- if true then return end
+-- 同一轮加载只安装一次补丁，避免入口被其他模组重复调用时再次包装
+if ModManager._client_mod_conversion_initialized then
+    return
+end
 
-local DEBUG_print = GetModConfigData("DEBUGPrint", true) and function(...) print("[客户端MOD转为服务器MOD]", ...) end or function(...) end
-local clientmods = GetModConfigData("client_mods_list") or {}
-local ServerAreClientModsDisabled = false -- 服务器是否开启“友好的禁用客户端模组”
+local DEBUG_print = GetModConfigData("DEBUGPrint", true) and function(...)
+    print("[客户端MOD转为服务器MOD]", ...)
+end or function() end
 
-if TheNet:IsDedicated() then -- 服务器：将转换的客户端模组添加到“服务器模组列表”中，这样客户端进服时就会自动下载并启用那些客户端模组
+local function Warn(...)
+    print("[客户端MOD转为服务器MOD]", ...)
+end
+
+local function CopyValues(values)
+    local result = {}
+    if type(values) == "table" then
+        for k, v in pairs(values) do
+            result[k] = v
+        end
+    end
+    return result
+end
+
+-- 配置值可以是 false；只有 nil 才表示需要回退
+local function FirstDefined(a, b, c)
+    if a ~= nil then
+        return a
+    elseif b ~= nil then
+        return b
+    end
+    return c
+end
+
+-- 不直接改写 GetModConfigData 返回的表，避免污染本模组的临时配置
+local clientmods = {}
+local configured_mods = GetModConfigData("client_mods_list")
+if type(configured_mods) == "table" then
+    for name, data in pairs(configured_mods) do
+        if type(name) == "string" and name ~= modname and type(data) == "table" then
+            clientmods[name] = {version = data.version, config = CopyValues(data.config)}
+        else
+            Warn("忽略无效的转换配置：", name)
+        end
+    end
+end
+
+local known_mods = KnownModIndex.savedata.known_mods
+
+if TheNet:IsDedicated() then
+    -- 专服只公布下载要求和配置，不把客户端模组加入执行列表
+    for name, data in pairs(clientmods) do
+        local known_mod = known_mods[name] or {}
+        known_mods[name] = known_mod
+        local info = known_mod.modinfo or {}
+        known_mod.modinfo = info
+        info.client_only_mod = false
+        info.all_clients_require_mod = true
+        if type(data.version) == "string" and data.version ~= "" then
+            info.version = data.version
+            info.version_compatible = data.version
+        else
+            info.version = info.version or ""
+        end
+
+        local options = {}
+        for option, value in pairs(data.config) do
+            options[#options + 1] = {name = option, saved = value}
+        end
+        info.configuration_options = options
+    end
+
     local OldGetEnabledServerModNames = ModManager.GetEnabledServerModNames
-    ModManager.GetEnabledServerModNames = function(self,...)
-        local server_mods = OldGetEnabledServerModNames(self,...)
-            if IsNotConsole() then
-                for k,v in pairs(clientmods) do
-                    if not table.contains(server_mods, k) then
-                        table.insert(server_mods, k)
+    ModManager.GetEnabledServerModNames = function(self, ...)
+        local names = OldGetEnabledServerModNames(self, ...)
+        if IsNotConsole() then
+            for name in pairs(clientmods) do
+                if not table.contains(names, name) then
+                    names[#names + 1] = name
+                end
+            end
+        end
+        return names
+    end
+
+    -- mods.lua 的 GetEnabledServerModsConfigData 会再次调用此方法
+    -- 转换配置必须来自转换清单，不能被专服磁盘上的旧客户端配置覆盖
+    local OldLoadModConfigurationOptions = KnownModIndex.LoadModConfigurationOptions
+    KnownModIndex.LoadModConfigurationOptions = function(self, name, ...)
+        if clientmods[name] then
+            return self.savedata.known_mods[name].modinfo.configuration_options
+        end
+        return OldLoadModConfigurationOptions(self, name, ...)
+    end
+
+    ModManager._client_mod_conversion_initialized = true
+    return
+end
+
+local listing = TheNet:GetServerListing()
+if (listing and listing.client_mods_disabled) or KnownModIndex:IsModEnabledAny("workshop-2860210553") then
+    for _, description in pairs(listing and listing.mods_description or {}) do
+        local name = description.mod_name
+        local known_mod = known_mods[name]
+        local info = known_mod and known_mod.modinfo
+        if info and info.client_only_mod and info.all_clients_require_mod and not clientmods[name] then
+            -- 双标志模组也需要解除临时禁用，但保留已有转换配置
+            clientmods[name] = {config = {}}
+        end
+    end
+end
+
+for name in pairs(clientmods) do
+    local known_mod = known_mods[name]
+    if not (known_mod and known_mod.modinfo and not known_mod.modinfo.failed
+        and KnownModIndex:IsModTempEnabled(name) and KnownModIndex:IsModCompatibleWithMode(name)) then
+        Warn("跳过未被服务器临时启用、未下载或不兼容的模组：", name)
+        clientmods[name] = nil
+    end
+end
+if not next(clientmods) then
+    return
+end
+
+-- 原版 LoadMods 此时正用 ipairs 遍历 mods；已执行的前缀不能移动
+local loading_index
+for i, mod in ipairs(ModManager.mods) do
+    if mod.modname == modname and ModManager.currentlyloadingmod == modname then
+        loading_index = i
+        break
+    end
+end
+if not loading_index then
+    Warn("未找到当前模组的加载位置，本轮停止转换，避免破坏模组加载顺序")
+    return
+end
+ModManager._client_mod_conversion_initialized = true
+
+local OldGetModConfigurationName = KnownModIndex.GetModConfigurationName
+KnownModIndex.GetModConfigurationName = function(self, name, client_config, ...)
+    if clientmods[name] then
+        -- 转换前的纯客户端模组一直使用无 _CLIENT 后缀的文件
+        client_config = false
+    end
+    return OldGetModConfigurationName(self, name, client_config, ...)
+end
+
+local function SetOptionValue(known_mod, option, value)
+    -- modutil.lua 会依次读取这些字段，必须保持同一个最终值
+    option.saved = value
+    option.saved_client = value
+    option.saved_server = value
+    known_mod.temp_config_options[option.name] = value
+end
+
+for name, data in pairs(clientmods) do
+    local known_mod = known_mods[name]
+    local info = known_mod.modinfo
+    local server_values = CopyValues(known_mod.temp_config_options)
+    for option, value in pairs(data.config) do
+        server_values[option] = value
+    end
+
+    info.configuration_options = info.configuration_options or {}
+    -- 清掉以前加载遗留的字段，再从原客户端配置文件读取本地保存值
+    for _, option in pairs(info.configuration_options) do
+        option.saved = nil
+        option.saved_client = nil
+        option.saved_server = nil
+    end
+    KnownModIndex:LoadModConfigurationOptions(name, false)
+    known_mod.temp_config_options = known_mod.temp_config_options or {}
+    for _, option in pairs(info.configuration_options) do
+        if type(option) == "table" and option.name then
+            SetOptionValue(known_mod, option, FirstDefined(option.saved, server_values[option.name], option.default))
+        end
+    end
+
+    info.all_clients_require_mod = true
+    info.client_only_mod = false
+    known_mod.temp_disabled = false
+    DEBUG_print("已转换客户端模组：", name)
+end
+
+local OldIsModEnabled = KnownModIndex.IsModEnabled
+KnownModIndex.IsModEnabled = function(self, name, ...)
+    if clientmods[name] then
+        return true
+    end
+    return OldIsModEnabled(self, name, ...)
+end
+
+local OldGetModConfigurationOptions = KnownModIndex.GetModConfigurationOptions_Internal
+KnownModIndex.GetModConfigurationOptions_Internal = function(self, name, force_local_options, ...)
+    if clientmods[name] then
+        force_local_options = true
+    end
+    return OldGetModConfigurationOptions(self, name, force_local_options, ...)
+end
+
+-- 游戏内重新加载或保存配置时，也要同步三套字段和临时配置
+local OldUpdateConfigurationOptions = KnownModIndex.UpdateConfigurationOptions
+KnownModIndex.UpdateConfigurationOptions = function(self, options, savedata, client_config, ...)
+    for name in pairs(clientmods) do
+        local known_mod = self.savedata.known_mods[name]
+        if known_mod and known_mod.modinfo.configuration_options == options then
+            for _, saved in pairs(savedata) do
+                if saved.saved ~= nil then
+                    for _, option in pairs(options) do
+                        if option.name == saved.name then
+                            SetOptionValue(known_mod, option, saved.saved)
+                        end
                     end
                 end
             end
-        return server_mods
-    end
-else -- 客户端
-
-    -- 检测服务器是否开启“友好的禁用客户端模组”
-    local server_listing = TheNet:GetServerListing()
-    if server_listing and server_listing.client_mods_disabled then
-        ServerAreClientModsDisabled = true
-    end
-
-    -- 修复客户端兼服务器mod会被禁本地影响的问题
-    if ServerAreClientModsDisabled or KnownModIndex:IsModEnabledAny("workshop-2860210553") then
-        local server_mods = {}
-        if server_listing and server_listing.mods_description then
-            for k,v in pairs (server_listing.mods_description) do
-                table.insert(server_mods, v.mod_name)
-            end
-        end
-        for _, k in ipairs(server_mods) do
-            local mod_data = KnownModIndex.savedata.known_mods[k]
-            if mod_data and mod_data.modinfo then
-                if mod_data.modinfo.client_only_mod and mod_data.modinfo.all_clients_require_mod then
-                    DEBUG_print("要转换为【纯服务器】的【客户端兼服务器】模组：", k)
-                    clientmods[k] = {
-                        version = mod_data.modinfo.version or "", -- 这个重要吗？似乎不重要，因为这只影响进服... 这个比较特殊，是在进服后 客户端自己搞的
-                        config = {} -- 不设置，遵循客户端自己的想法
-                    }
-                end
-            end
+            break
         end
     end
-
-    -- 检查是否下载并正确开启了所需的客户端模组
-    for k in pairs(clientmods) do
-        if not (KnownModIndex:GetModInfo(k) and KnownModIndex:IsModTempEnabled(k)) then
-            DEBUG_print("检测到当前未正常下载所需的客户端模组：" .. tostring(k) .. " ，停止加载本模组！！！")
-            DEBUG_print("可能是服务器为独行长路/无洞穴世界，所以服务器没将模组添加到服务器模组列表，所以玩家不会临时启用那些客户端模组，所以这里检测不通过")
-            return
-        end
-    end
+    return OldUpdateConfigurationOptions(self, options, savedata, client_config, ...)
 end
 
-local need_kleiregistermods = {} -- 需要注册的客户端模组
-
--- Sort the mods by priority, so that "library" mods can load first
-local function sanitizepriority(priority)
-    local prioritytype = type(priority)
-    if prioritytype == "string" then
-        return tonumber(priority) or 0
-    elseif prioritytype == "number" then
-        return priority
-    end
-    return 0
-end
-local function modPrioritySort(a, b)
-    -- NOTES(JBK): Mac OS changed locale sorting so we have to do this using stringidsorter to avoid locale issues.
-    -- I am also changing how it is sorted if the modinfo is not present to use the mod's modname instead.
-    -- All priority fields are going to be converted to a number.
-    if a.modinfo and b.modinfo then
-        local apriority = sanitizepriority(a.modinfo.priority)
-        local bpriority = sanitizepriority(b.modinfo.priority)
-        if apriority == bpriority then
-            local aname = a.modinfo.name
-            if type(aname) ~= "string" then
-                aname = a.modname
+local OldSetConfigurationOption = KnownModIndex.SetConfigurationOption
+KnownModIndex.SetConfigurationOption = function(self, name, option_name, value, ...)
+    local known_mod = clientmods[name] and self.savedata.known_mods[name]
+    if known_mod then
+        for _, option in pairs(known_mod.modinfo.configuration_options) do
+            if option.name == option_name then
+                SetOptionValue(known_mod, option, value)
             end
-            local bname = b.modinfo.name
-            if type(bname) ~= "string" then
-                bname = b.modname
-            end
-            return stringidsorter(aname, bname)
         end
-        return apriority > bpriority
+    end
+    return OldSetConfigurationOption(self, name, option_name, value, ...)
+end
+
+local function Priority(info)
+    return tonumber(info.priority) or 0
+end
+
+local function ModPrioritySort(a, b)
+    local ai, bi = a.modinfo, b.modinfo
+    if ai and bi then
+        local ap, bp = Priority(ai), Priority(bi)
+        if ap ~= bp then
+            return ap > bp
+        end
+        return stringidsorter(type(ai.name) == "string" and ai.name or a.modname,
+            type(bi.name) == "string" and bi.name or b.modname)
     end
     return stringidsorter(a.modname, b.modname)
 end
-local function insert_sorted(tbl, value)
-    for i = 1, #tbl do
-        if modPrioritySort(value, tbl[i]) then
-            table.insert(tbl, i, value)
-            return
-        end
+
+local remaining, present, added = {}, {}, {}
+for i, mod in ipairs(ModManager.mods) do
+    present[mod.modname] = true
+    if i > loading_index then
+        remaining[#remaining + 1] = mod
+    elseif i < loading_index and clientmods[mod.modname] then
+        Warn("此模组已先于转换层初始化，无法回溯其初始化期间的配置读取：", mod.modname)
     end
-    table.insert(tbl, value)
 end
-
-local function Loadingclientmods(modname) -- 手动初始化客户端模组并添加到模组加载列表中
-    if not table.contains(ModManager.modnames, modname) and ModManager.worldgen == false or (ModManager.worldgen == true and KnownModIndex:IsModCompatibleWithMode(modname)) then
-        DEBUG_print("将客户端模组：", modname, "添加到模组加载列表中")
-        table.insert(ModManager.modnames, modname)
-
-        if ModManager.worldgen == false then
-            -- Make sure we load the config data before the mod (but not during worldgen)
-            if TheNet:GetIsServer() and not TheNet:IsDedicated() then
-                local options = KnownModIndex:LoadModConfigurationOptions(modname, false)
-
-                KnownModIndex:SetTempModConfigData({[modname] = options})
-
-                KnownModIndex:LoadModConfigurationOptions(modname, true)
-            else
-                KnownModIndex:LoadModConfigurationOptions(modname, not TheNet:GetIsServer())
-            end
+for name in pairs(clientmods) do
+    if not present[name] then
+        local mod = CreateEnvironment(name, false)
+        mod.modinfo = known_mods[name].modinfo
+        remaining[#remaining + 1] = mod
+        added[mod] = true
+        if not table.contains(ModManager.modnames, name) then
+            ModManager.modnames[#ModManager.modnames + 1] = name
         end
-
-        local initenv = KnownModIndex:GetModInfo(modname)
-        local env = CreateEnvironment(modname,  ModManager.worldgen)
-        env.modinfo = initenv
-
-        -- table.insert( ModManager.mods, env ) -- 将模组添加到饥荒需要加载的模组列表中
-        insert_sorted(ModManager.mods, env) -- 根据模组加载优先级插入到正确位置
-        table.insert( need_kleiregistermods, env )
-        local loadmsg = "Loading mod: "..ModInfoname(modname).." Version:"..env.modinfo.version
-        if initenv.modinfo_message and initenv.modinfo_message ~= "" then
-            loadmsg = loadmsg .. " ("..initenv.modinfo_message..")"
-        end
-        print(loadmsg)
+        DEBUG_print("补入尚未执行的模组列表：", name)
     end
 end
 
--- 额外处理
-for k in pairs(clientmods) do
-    if not KnownModIndex.savedata.known_mods[k] and TheNet:IsDedicated() then -- 只有专服才能使用方法一
-        DEBUG_print("使用方法一转换MOD类型", k)
-        KnownModIndex.savedata.known_mods[k] = {}
-        local known_mod = KnownModIndex.savedata.known_mods[k]
-        known_mod.modinfo = {
-            all_clients_require_mod = true,
-            client_only_mod = false,
-            version = clientmods[k].version,
-        }
-    elseif KnownModIndex.savedata.known_mods[k] and KnownModIndex.savedata.known_mods[k].modinfo then
-        DEBUG_print("使用方法二转换MOD类型", k," = ",clientmods[k].version)
-        KnownModIndex.savedata.known_mods[k].modinfo.all_clients_require_mod = true
-        KnownModIndex.savedata.known_mods[k].modinfo.client_only_mod = false
-        KnownModIndex.savedata.known_mods[k].temp_disabled = false -- 使Chinese++ Pro能够正确判断其它客户端模组是否开启
-    end
-
-    -- 被添加至服务器的客户端MOD，如果有设置过就加载自己设置的选项，否则加载服务器提供的选项，否则加载默认选项
-    local known_mod = KnownModIndex.savedata.known_mods[k]
-    if known_mod and known_mod.modinfo then
-        if not known_mod.modinfo.configuration_options then -- MOD未下载的情况（仅服务器可能会走这条分支）
-            known_mod.modinfo.configuration_options = {}
-            local mod_options = known_mod.modinfo.configuration_options
-            for k1,v1 in pairs(clientmods[k].config or {}) do
-                table.insert(mod_options,{
-                    name = k1,
-                    saved = v1 -- 未下载对应客户端Mod的情况下，仅使用来自本Mod设置的配置
-                })
-                DEBUG_print("正在使用方法一设置客户端模组设置", k, k1, "=", v1)
-            end
-        else -- MOD已下载的情况
-            KnownModIndex:LoadModConfigurationOptions(k) -- 加载保存的模组设置文件
-            local mod_options = known_mod.modinfo.configuration_options
-            for _, k1 in pairs(mod_options) do
-                for k2,v2 in pairs(clientmods[k].config or {}) do
-                    if k1.name == k2 then
-                        k1.saved = k1.saved or v2 or k1.default -- 本地保存的设置/服务器设置/默认设置
-                        DEBUG_print("正在使用方法二设置客户端模组设置", k, k1.name, "=", k1.saved)
-                        break
-                    end
-                end
-            end
-
-            if known_mod.temp_config_options then -- 给客户端执行的
-                local temp_options = known_mod.temp_config_options
-                for _, k1 in pairs(mod_options) do
-                    if type(k1) == "table" and k1.name then
-                        temp_options[k1.name] = k1.saved or temp_options[k1.name] or k1.default -- 本地保存的设置/服务器设置/默认设置
-                        DEBUG_print("正在修改临时模组设置", k, k1.name, "=", temp_options[k1.name])
-                    else
-                        DEBUG_print("修改临时模组设置时出错，k = " .. tostring(k) , "type(k1) = " .. tostring(type(k1)), "值为" .. tostring(k1))
-                    end
-                end
-            end
-        end
-    end
-
-    -- 兼容"友好的禁用客户端模组" (手动在此处加载被转换的客户端模组)
-    if TheNet:GetIsClient() then
-        if ServerAreClientModsDisabled then
-            DEBUG_print("检测到服务器开启了“友好的禁用客户端模组”  开始进行额外处理")
-            Loadingclientmods(k)
-        end
+-- 只重排未执行部分，新模组继续由原版负责路径、manifest 和两个入口
+local register = {}
+table.sort(remaining, ModPrioritySort)
+for i, mod in ipairs(remaining) do
+    ModManager.mods[loading_index + i] = mod
+    if added[mod] then
+        register[#register + 1] = mod
     end
 end
-
-if TheNet:GetIsClient() and ServerAreClientModsDisabled then
-    kleiregistermods(need_kleiregistermods) -- 使用科雷的C层函数注册模组
-end
-
-if TheNet:GetIsClient() then
-    -- 修复部分行为不一致的问题
-
-    local _ModIndex_IsModEnabled = KnownModIndex.IsModEnabled
-    KnownModIndex.IsModEnabled = function(self, modname, ...)
-        local mod_enabled = _ModIndex_IsModEnabled(self, modname, ...)
-        return mod_enabled or clientmods[modname]
-    end
-
-    local _GetModConfigurationOptions_Internal = KnownModIndex.GetModConfigurationOptions_Internal
-    KnownModIndex.GetModConfigurationOptions_Internal = function(self, modname, force_local_options, ...)
-        return _GetModConfigurationOptions_Internal(self, modname, force_local_options or clientmods[modname], ...)
-    end
+if #register > 0 then
+    kleiregistermods(register)
 end
