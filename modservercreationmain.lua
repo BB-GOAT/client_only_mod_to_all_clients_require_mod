@@ -4,7 +4,7 @@ GLOBAL.setmetatable(env, {
     end
 })
 
-local lang = GetModConfigData("lang") or "auto"
+local lang = GetModConfigData("language") or "auto"
 if lang == "auto" then
     lang = GLOBAL.LanguageTranslator.defaultlang
 end

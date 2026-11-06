@@ -7,7 +7,7 @@ end
 name = zh_en("客户端Mod转为服务器Mod", "Convert client mod to server mod")
 author = "冰冰羊"
 description = [[]]
-version = "0.4"
+version = "0.4.1"
 version_compatible = "0.4"
 dst_compatible = true
 forge_compatible = true
